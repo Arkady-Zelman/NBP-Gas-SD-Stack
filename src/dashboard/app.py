@@ -1442,7 +1442,7 @@ def page_trading_charts():
 
 def page_price_forecast():
     st.title("NBP Price Forecast")
-    st.caption("Machine-learning model using supply, demand, storage, and seasonality as features")
+    st.caption("Multi-model comparison: GradientBoosting, XGBoost, and Prophet — best model auto-selected")
 
     prices = _load_prices()
     _, balance_df, _ = _load_balance(start_str, end_str)
@@ -1459,13 +1459,13 @@ def page_price_forecast():
     prices["date"] = pd.to_datetime(prices["date"])
 
     df = pd.merge(balance_df, prices[["date", "sap"]], on="date", how="inner").dropna(subset=["sap"])
-    if len(df) < 30:
-        st.warning("Not enough overlapping data for a model (need 30+ days).")
+    df = df.sort_values("date").reset_index(drop=True)
+    if len(df) < 60:
+        st.warning("Not enough overlapping data for models (need 60+ days).")
         return
 
-    # Feature engineering
+    # Feature engineering for tree models
     df["day_of_year"] = df["date"].dt.dayofyear
-    df["month"] = df["date"].dt.month
     df["weekday"] = df["date"].dt.weekday
     df["sin_doy"] = np.sin(2 * np.pi * df["day_of_year"] / 365)
     df["cos_doy"] = np.cos(2 * np.pi * df["day_of_year"] / 365)
@@ -1474,116 +1474,245 @@ def page_price_forecast():
     df["balance_7d"] = df["balance_mcm"].rolling(7, min_periods=1).mean()
     df["sap_lag1"] = df["sap"].shift(1)
     df["sap_lag7"] = df["sap"].shift(7)
-    df = df.dropna()
+    df["sap_ret1"] = df["sap"].diff()
+    df_clean = df.dropna().copy()
 
     features = ["total_supply", "total_demand", "balance_mcm",
                 "sin_doy", "cos_doy", "weekday",
                 "supply_7d", "demand_7d", "balance_7d",
                 "sap_lag1", "sap_lag7"]
-    target = "sap"
 
     from sklearn.ensemble import GradientBoostingRegressor
-    from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import mean_absolute_error, r2_score
 
-    X = df[features].values
-    y = df[target].values
-    dates_arr = df["date"].values
+    X = df_clean[features].values
+    y = df_clean["sap"].values
+    dates_arr = df_clean["date"].values
 
-    # Time-series split: train on first 80%, test on last 20%
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
-    dates_train, dates_test = dates_arr[:split_idx], dates_arr[split_idx:]
+    dates_test = dates_arr[split_idx:]
 
-    model = GradientBoostingRegressor(
-        n_estimators=200, max_depth=4, learning_rate=0.05,
+    # ── Model 1: GradientBoosting ──
+    gb = GradientBoostingRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, random_state=42,
     )
-    model.fit(X_train, y_train)
-    y_pred_train = model.predict(X_train)
-    y_pred_test = model.predict(X_test)
+    gb.fit(X_train, y_train)
+    gb_pred = gb.predict(X_test)
+    results = {"GradientBoosting": {
+        "mae": mean_absolute_error(y_test, gb_pred),
+        "r2": r2_score(y_test, gb_pred),
+        "pred": gb_pred, "model": gb, "type": "tree",
+    }}
 
-    mae = mean_absolute_error(y_test, y_pred_test)
-    r2 = r2_score(y_test, y_pred_test)
+    # ── Model 2: XGBoost ──
+    try:
+        from xgboost import XGBRegressor
+        xgb = XGBRegressor(
+            n_estimators=300, max_depth=4, learning_rate=0.05,
+            subsample=0.8, random_state=42, verbosity=0,
+        )
+        xgb.fit(X_train, y_train)
+        xgb_pred = xgb.predict(X_test)
+        results["XGBoost"] = {
+            "mae": mean_absolute_error(y_test, xgb_pred),
+            "r2": r2_score(y_test, xgb_pred),
+            "pred": xgb_pred, "model": xgb, "type": "tree",
+        }
+    except Exception as exc:
+        st.caption(f"XGBoost unavailable: {exc}")
 
-    # Metrics
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Test MAE", f"{mae:.3f} p/therm")
-    m2.metric("Test R²", f"{r2:.3f}")
-    m3.metric("Training samples", f"{len(X_train)}")
+    # ── Model 3: Prophet ──
+    try:
+        from prophet import Prophet
+        import logging
+        logging.getLogger("prophet").setLevel(logging.WARNING)
+        logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 
-    # Actual vs Predicted chart
-    st.subheader("Actual vs Predicted SAP")
+        prophet_df = df_clean[["date", "sap", "total_supply", "total_demand", "balance_mcm"]].copy()
+        prophet_df = prophet_df.rename(columns={"date": "ds", "sap": "y"})
+        p_train = prophet_df.iloc[:split_idx]
+        p_test = prophet_df.iloc[split_idx:]
+
+        m = Prophet(daily_seasonality=False, weekly_seasonality=True,
+                    yearly_seasonality=True, changepoint_prior_scale=0.1)
+        m.add_regressor("total_supply")
+        m.add_regressor("total_demand")
+        m.add_regressor("balance_mcm")
+        m.fit(p_train)
+
+        prophet_pred = m.predict(p_test[["ds", "total_supply", "total_demand", "balance_mcm"]])
+        prophet_yhat = prophet_pred["yhat"].values
+        results["Prophet"] = {
+            "mae": mean_absolute_error(y_test, prophet_yhat),
+            "r2": r2_score(y_test, prophet_yhat),
+            "pred": prophet_yhat, "model": m, "type": "prophet",
+            "train_df": p_train,
+        }
+    except Exception as exc:
+        st.caption(f"Prophet unavailable: {exc}")
+
+    # ── Model 4: NeuralProphet (optional) ──
+    try:
+        from neuralprophet import NeuralProphet, set_log_level
+        set_log_level("ERROR")
+
+        np_df = df_clean[["date", "sap", "total_supply", "total_demand", "balance_mcm"]].copy()
+        np_df = np_df.rename(columns={"date": "ds", "sap": "y"})
+        np_train = np_df.iloc[:split_idx]
+        np_test = np_df.iloc[split_idx:]
+
+        npm = NeuralProphet(epochs=50, learning_rate=0.01, batch_size=32,
+                            yearly_seasonality=True, weekly_seasonality=True)
+        npm.add_lagged_regressor("total_supply")
+        npm.add_lagged_regressor("total_demand")
+        npm.add_lagged_regressor("balance_mcm")
+        npm.fit(np_train, freq="D")
+
+        np_pred = npm.predict(np_test)
+        np_yhat = np_pred["yhat1"].values
+        results["NeuralProphet"] = {
+            "mae": mean_absolute_error(y_test[:len(np_yhat)], np_yhat[:len(y_test)]),
+            "r2": r2_score(y_test[:len(np_yhat)], np_yhat[:len(y_test)]),
+            "pred": np_yhat, "model": npm, "type": "neuralprophet",
+        }
+    except Exception:
+        pass
+
+    # ── Model comparison table ──
+    st.subheader("Model Comparison")
+    comp_rows = []
+    for name, r in results.items():
+        comp_rows.append({"Model": name, "MAE (p/therm)": r["mae"], "R²": r["r2"]})
+    comp_df = pd.DataFrame(comp_rows).sort_values("MAE (p/therm)")
+    st.dataframe(
+        comp_df.style.format({"MAE (p/therm)": "{:.4f}", "R²": "{:.4f}"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    best_name = comp_df.iloc[0]["Model"]
+    best = results[best_name]
+    st.success(f"**{best_name}** selected — lowest MAE: {best['mae']:.4f} p/therm")
+
+    # ── Actual vs Predicted (best model) ──
+    st.subheader(f"Actual vs Predicted — {best_name}")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates_arr, y=y, name="Actual SAP",
-                             line=dict(color="#e67e22", width=2)))
-    fig.add_trace(go.Scatter(x=dates_train, y=y_pred_train, name="Train pred",
-                             line=dict(color="#3498db", width=1, dash="dot"), opacity=0.6))
-    fig.add_trace(go.Scatter(x=dates_test, y=y_pred_test, name="Test pred",
-                             line=dict(color="#2ecc71", width=2)))
+    fig.add_trace(go.Scatter(
+        x=dates_arr, y=y, name="Actual SAP",
+        line=dict(color="#e67e22", width=2),
+        hovertemplate="%{x|%d %b %Y}<br>Actual: %{y:.2f}<extra></extra>",
+    ))
+    model_colors = {"GradientBoosting": "#3498db", "XGBoost": "#2ecc71",
+                    "Prophet": "#9b59b6", "NeuralProphet": "#e74c3c"}
+    for name, r in results.items():
+        pred_vals = r["pred"]
+        fig.add_trace(go.Scatter(
+            x=dates_test[:len(pred_vals)], y=pred_vals, name=name,
+            line=dict(color=model_colors.get(name, "#95a5a6"), width=1.5,
+                      dash="dot" if name != best_name else "solid"),
+            opacity=0.5 if name != best_name else 1.0,
+        ))
     split_x = str(pd.Timestamp(dates_test[0]).date())
     fig.add_shape(type="line", x0=split_x, x1=split_x, y0=0, y1=1,
                   yref="paper", line=dict(dash="dash", color="rgba(255,255,255,0.3)"))
     _apply_layout(fig, yaxis_title="SAP (p/therm)", height=450)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Feature importance
-    st.subheader("Feature Importance")
-    imp = pd.DataFrame({
-        "Feature": features,
-        "Importance": model.feature_importances_,
-    }).sort_values("Importance")
-    fig_imp = go.Figure(go.Bar(
-        x=imp["Importance"], y=imp["Feature"], orientation="h",
-        marker_color="#3498db",
-        hovertemplate="<b>%{y}</b><br>Importance: %{x:.3f}<extra></extra>",
-    ))
-    _apply_layout(fig_imp, xaxis_title="Importance", height=350, showlegend=False)
-    st.plotly_chart(fig_imp, use_container_width=True)
+    # ── Feature importance (tree models) ──
+    if best["type"] == "tree":
+        st.subheader("Feature Importance")
+        imp = pd.DataFrame({
+            "Feature": features,
+            "Importance": best["model"].feature_importances_,
+        }).sort_values("Importance")
+        fig_imp = go.Figure(go.Bar(
+            x=imp["Importance"], y=imp["Feature"], orientation="h",
+            marker_color=model_colors.get(best_name, "#3498db"),
+            hovertemplate="<b>%{y}</b><br>%{x:.3f}<extra></extra>",
+        ))
+        _apply_layout(fig_imp, xaxis_title="Importance", height=350, showlegend=False)
+        st.plotly_chart(fig_imp, use_container_width=True)
 
-    # Forward forecast
+    # ── Forward forecast with continuity anchoring ──
     st.markdown("---")
     st.subheader("Forward Price Projection")
-    fwd_days = st.slider("Forecast horizon (days)", 7, 60, 14, key="price_fwd")
+    fwd_days = st.slider("Forecast horizon (days)", 7, 60, 21, key="price_fwd")
 
-    last_row = df.iloc[-1]
-    fwd_dates = pd.date_range(df["date"].iloc[-1] + timedelta(days=1), periods=fwd_days, freq="D")
-    fwd_prices = []
-    prev_sap = last_row["sap"]
-    prev_sap7 = last_row.get("sap_lag7", prev_sap)
+    last_actual_sap = df_clean["sap"].iloc[-1]
+    last_row = df_clean.iloc[-1]
+    fwd_dates = pd.date_range(df_clean["date"].iloc[-1] + timedelta(days=1),
+                               periods=fwd_days, freq="D")
 
-    for i, fd in enumerate(fwd_dates):
-        feat = np.array([[
-            last_row["total_supply"], last_row["total_demand"], last_row["balance_mcm"],
-            np.sin(2 * np.pi * fd.dayofyear / 365),
-            np.cos(2 * np.pi * fd.dayofyear / 365),
-            fd.weekday(),
-            last_row["supply_7d"], last_row["demand_7d"], last_row["balance_7d"],
-            prev_sap, prev_sap7,
-        ]])
-        pred = model.predict(feat)[0]
-        fwd_prices.append(pred)
-        prev_sap7 = prev_sap if i >= 6 else prev_sap7
-        prev_sap = pred
+    if best["type"] == "prophet":
+        future = pd.DataFrame({"ds": fwd_dates})
+        future["total_supply"] = last_row["total_supply"]
+        future["total_demand"] = last_row["total_demand"]
+        future["balance_mcm"] = last_row["balance_mcm"]
+        raw_fwd = best["model"].predict(future)["yhat"].values
+        bias = last_actual_sap - raw_fwd[0]
+        decay = np.exp(-np.arange(len(raw_fwd)) / (fwd_days * 2))
+        fwd_prices = raw_fwd + bias * decay
+    elif best["type"] == "tree":
+        # Auto-regressive forward projection with continuity anchor
+        fwd_prices = []
+        prev_sap = last_actual_sap
+        prev_sap7 = last_row["sap_lag7"] if "sap_lag7" in last_row.index else prev_sap
+
+        # Compute model's bias on last known day
+        last_feat = last_row[features].values.reshape(1, -1)
+        model_at_last = best["model"].predict(last_feat)[0]
+        anchor_bias = last_actual_sap - model_at_last
+
+        for i, fd in enumerate(fwd_dates):
+            feat = np.array([[
+                last_row["total_supply"], last_row["total_demand"],
+                last_row["balance_mcm"],
+                np.sin(2 * np.pi * fd.dayofyear / 365),
+                np.cos(2 * np.pi * fd.dayofyear / 365),
+                fd.weekday(),
+                last_row["supply_7d"], last_row["demand_7d"],
+                last_row["balance_7d"],
+                prev_sap, prev_sap7,
+            ]])
+            raw_pred = best["model"].predict(feat)[0]
+            # Decaying bias correction for smooth continuity
+            decay_factor = np.exp(-i / (fwd_days * 2))
+            pred = raw_pred + anchor_bias * decay_factor
+            fwd_prices.append(pred)
+            prev_sap7 = prev_sap if i >= 6 else prev_sap7
+            prev_sap = pred
+    else:
+        fwd_prices = [last_actual_sap] * fwd_days
 
     fig_fwd = go.Figure()
+    hist_tail = df_clean.tail(60)
     fig_fwd.add_trace(go.Scatter(
-        x=df["date"].tail(60), y=df["sap"].tail(60), name="Historical SAP",
+        x=hist_tail["date"], y=hist_tail["sap"], name="Historical SAP",
         line=dict(color="#e67e22", width=2),
+        hovertemplate="%{x|%d %b %Y}<br>%{y:.2f} p/therm<extra></extra>",
     ))
     fig_fwd.add_trace(go.Scatter(
-        x=fwd_dates, y=fwd_prices, name="Forecast",
-        line=dict(color="#2ecc71", width=2, dash="dash"),
+        x=fwd_dates, y=fwd_prices, name=f"{best_name} Forecast",
+        line=dict(color=model_colors.get(best_name, "#2ecc71"), width=2.5, dash="dash"),
         hovertemplate="%{x|%d %b %Y}<br>Forecast: %{y:.2f} p/therm<extra></extra>",
     ))
-    _apply_layout(fig_fwd, yaxis_title="SAP (p/therm)", height=350)
+    # Connection line from last actual to first forecast
+    fig_fwd.add_trace(go.Scatter(
+        x=[hist_tail["date"].iloc[-1], fwd_dates[0]],
+        y=[last_actual_sap, fwd_prices[0]],
+        mode="lines", line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dot"),
+        showlegend=False,
+    ))
+    _apply_layout(fig_fwd, yaxis_title="SAP (p/therm)", height=380)
     st.plotly_chart(fig_fwd, use_container_width=True)
 
     st.caption(
-        f"Gradient Boosting model with {len(features)} features. "
-        f"Forward projection holds supply/demand constant at last observed values "
-        f"and iterates SAP lag features."
+        f"Best model: **{best_name}** (MAE {best['mae']:.4f}). "
+        f"Forward projection anchored to last actual SAP ({last_actual_sap:.2f} p/therm) "
+        f"with decaying bias correction for price continuity. "
+        f"Supply/demand held at last observed values."
     )
 
 
