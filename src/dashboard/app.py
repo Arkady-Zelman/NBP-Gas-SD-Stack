@@ -40,10 +40,10 @@ st.set_page_config(
 )
 
 # =====================================================================
-# Smart auto-refresh: only if cache is stale (>1 hour) or missing
+# Smart auto-refresh: only if cache is stale (>24 hours) or missing
 # =====================================================================
 
-CACHE_MAX_AGE_HOURS = 1.0
+CACHE_MAX_AGE_HOURS = 24.0
 
 def _cache_is_stale() -> bool:
     """Check if the main cache file is missing or older than the threshold."""
@@ -63,7 +63,7 @@ def _do_refresh():
 if "startup_checked" not in st.session_state:
     st.session_state["startup_checked"] = True
     if _cache_is_stale():
-        with st.spinner("Cache is stale — refreshing from APIs (runs once per hour)..."):
+        with st.spinner("Cache is stale — refreshing from APIs (runs once per day)..."):
             _do_refresh()
 
 # =====================================================================
@@ -124,9 +124,11 @@ if st.sidebar.button("🔄 Refresh Data Now", type="primary"):
 cache_age = cache.age_hours("UKCS Production")
 if cache_age is not None:
     if cache_age < 1:
-        st.sidebar.caption(f"Data refreshed {cache_age * 60:.0f} min ago. Auto-refreshes hourly.")
+        st.sidebar.caption(f"Data refreshed {cache_age * 60:.0f} min ago. Auto-refreshes daily.")
+    elif cache_age < 24:
+        st.sidebar.caption(f"Data is {cache_age:.1f}h old. Auto-refreshes daily.")
     else:
-        st.sidebar.caption(f"Data is {cache_age:.1f}h old. Auto-refreshes when >1h stale.")
+        st.sidebar.caption(f"Data is {cache_age:.0f}h old — will refresh on next load.")
 else:
     st.sidebar.caption("No cached data. Click Refresh to fetch.")
 

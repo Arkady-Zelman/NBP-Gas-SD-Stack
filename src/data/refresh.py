@@ -5,13 +5,13 @@ parquet cache in data/raw/, and reports what succeeded and what failed.
 
 Usage:
     python -m src.data.refresh              # one-shot refresh
+    python -m src.data.refresh --loop 24    # repeat every 24 hours
     python -m src.data.refresh --loop 1     # repeat every 1 hour
-    python -m src.data.refresh --loop 0.5   # repeat every 30 minutes
 
 Scheduling (Windows Task Scheduler):
     Action:   python -m src.data.refresh
     Start in: your project folder
-    Trigger:  every 1 hour
+    Trigger:  every 24 hours
 """
 
 from __future__ import annotations
