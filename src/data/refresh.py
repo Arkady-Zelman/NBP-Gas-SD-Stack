@@ -32,8 +32,13 @@ from src.data import cache
 from src.config import get
 from src.data.gie_api import GIEClient
 from src.data.elexon_api import ElexonClient
-from src.data.national_gas import NationalGasClient
-from src.units import gwh_to_mcm
+from src.data.national_gas import (
+    NationalGasClient,
+    PUBOB_IDS,
+    STORAGE_INFLOW_IDS,
+    STORAGE_OUTFLOW_IDS,
+)
+from src.units import gwh_to_mcm, kwh_to_mcm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,11 +183,35 @@ def _refresh_national_gas() -> dict[str, str]:
 
     # Storage by site (per-facility flows for the map)
     try:
-        df = client.get_storage_by_site()
-        if df is not None and not df.empty:
-            df["data_quality"] = "api"
-            cache.save("Storage By Site", df)
-            results["Storage By Site"] = f"OK ({len(df)} rows, {df['site'].nunique()} sites)"
+        all_ids = STORAGE_INFLOW_IDS + STORAGE_OUTFLOW_IDS
+        pubob_ids = [PUBOB_IDS[k] for k in all_ids if k in PUBOB_IDS]
+        import io
+        from datetime import date as _date, timedelta as _td
+        raw = client._fetch_chunked(pubob_ids, _date.today() - _td(days=365), _date.today())
+        if raw is not None and not raw.empty:
+            raw = client._to_daily(raw)
+            raw.columns = raw.columns.str.strip()
+            parts = raw["Data Item"].str.split(",", n=2, expand=True)
+            raw["direction"] = parts[0].str.strip().str.lower()
+            raw["site"] = parts[1].str.strip()
+            import pandas as _pd
+            inj = (
+                raw[raw["direction"] == "inflow"]
+                .groupby(["date", "site"], as_index=False)["Value"].sum()
+                .rename(columns={"Value": "injection_mcm"})
+            )
+            inj["injection_mcm"] = kwh_to_mcm(inj["injection_mcm"])
+            wdr = (
+                raw[raw["direction"] == "outflow"]
+                .groupby(["date", "site"], as_index=False)["Value"].sum()
+                .rename(columns={"Value": "withdrawal_mcm"})
+            )
+            wdr["withdrawal_mcm"] = kwh_to_mcm(wdr["withdrawal_mcm"])
+            merged = _pd.merge(inj, wdr, on=["date", "site"], how="outer").fillna(0)
+            merged["net_mcm"] = merged["injection_mcm"] - merged["withdrawal_mcm"]
+            merged["data_quality"] = "api"
+            cache.save("Storage By Site", merged)
+            results["Storage By Site"] = f"OK ({len(merged)} rows, {merged['site'].nunique()} sites)"
         else:
             results["Storage By Site"] = "EMPTY"
     except Exception as exc:

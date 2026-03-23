@@ -734,10 +734,39 @@ def _load_storage_by_site(start_str: str | None, end_str: str | None):
             df = df[df["date"] <= end_str]
         return df
     try:
-        from src.data.national_gas import NationalGasClient
+        from src.data.national_gas import (
+            NationalGasClient, PUBOB_IDS,
+            STORAGE_INFLOW_IDS, STORAGE_OUTFLOW_IDS,
+        )
+        from src.units import kwh_to_mcm
         client = NationalGasClient()
-        start = start_str or (date.today() - timedelta(days=90)).isoformat()
-        return client.get_storage_by_site(start=start, end=end_str)
+        all_ids = STORAGE_INFLOW_IDS + STORAGE_OUTFLOW_IDS
+        pubob_ids = [PUBOB_IDS[k] for k in all_ids if k in PUBOB_IDS]
+        start_dt = date.fromisoformat(start_str) if start_str else date.today() - timedelta(days=90)
+        end_dt = date.fromisoformat(end_str) if end_str else date.today()
+        raw = client._fetch_chunked(pubob_ids, start_dt, end_dt)
+        if raw is None or raw.empty:
+            return None
+        raw = client._to_daily(raw)
+        raw.columns = raw.columns.str.strip()
+        parts = raw["Data Item"].str.split(",", n=2, expand=True)
+        raw["direction"] = parts[0].str.strip().str.lower()
+        raw["site"] = parts[1].str.strip()
+        inj = (
+            raw[raw["direction"] == "inflow"]
+            .groupby(["date", "site"], as_index=False)["Value"].sum()
+            .rename(columns={"Value": "injection_mcm"})
+        )
+        inj["injection_mcm"] = kwh_to_mcm(inj["injection_mcm"])
+        wdr = (
+            raw[raw["direction"] == "outflow"]
+            .groupby(["date", "site"], as_index=False)["Value"].sum()
+            .rename(columns={"Value": "withdrawal_mcm"})
+        )
+        wdr["withdrawal_mcm"] = kwh_to_mcm(wdr["withdrawal_mcm"])
+        merged = pd.merge(inj, wdr, on=["date", "site"], how="outer").fillna(0)
+        merged["net_mcm"] = merged["injection_mcm"] - merged["withdrawal_mcm"]
+        return merged.sort_values(["date", "site"]).reset_index(drop=True)
     except Exception:
         return None
 
