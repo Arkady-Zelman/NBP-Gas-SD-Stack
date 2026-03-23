@@ -724,7 +724,6 @@ STORAGE_SITES = {
 
 @st.cache_data(ttl=3600)
 def _load_storage_by_site(start_str: str | None, end_str: str | None):
-    from src.data.national_gas import NationalGasClient
     cached = cache.load("Storage By Site")
     if cached is not None and not cached.empty:
         df = cached.copy()
@@ -734,8 +733,13 @@ def _load_storage_by_site(start_str: str | None, end_str: str | None):
         if end_str:
             df = df[df["date"] <= end_str]
         return df
-    client = NationalGasClient()
-    return client.get_storage_by_site(start=start_str or "2020-10-01", end=end_str)
+    try:
+        from src.data.national_gas import NationalGasClient
+        client = NationalGasClient()
+        start = start_str or (date.today() - timedelta(days=90)).isoformat()
+        return client.get_storage_by_site(start=start, end=end_str)
+    except Exception:
+        return None
 
 
 def page_storage_map():
@@ -745,9 +749,10 @@ def page_storage_map():
     site_df = _load_storage_by_site(start_str, end_str)
 
     if site_df is None or site_df.empty:
-        st.warning(
-            "No per-site storage data in cache. "
-            "Click **Refresh Data Now** in the sidebar to fetch it."
+        st.info(
+            "Per-site storage data is not cached yet.  \n"
+            "Click **Refresh Data Now** in the sidebar — the next refresh "
+            "will fetch per-site flows from National Gas."
         )
         return
 
