@@ -1522,9 +1522,9 @@ def page_price_forecast():
                              line=dict(color="#3498db", width=1, dash="dot"), opacity=0.6))
     fig.add_trace(go.Scatter(x=dates_test, y=y_pred_test, name="Test pred",
                              line=dict(color="#2ecc71", width=2)))
-    fig.add_vline(x=str(pd.Timestamp(dates_test[0]).date()),
-                  line_dash="dash", line_color="rgba(255,255,255,0.3)",
-                  annotation_text="Train / Test split")
+    split_x = str(pd.Timestamp(dates_test[0]).date())
+    fig.add_shape(type="line", x0=split_x, x1=split_x, y0=0, y1=1,
+                  yref="paper", line=dict(dash="dash", color="rgba(255,255,255,0.3)"))
     _apply_layout(fig, yaxis_title="SAP (p/therm)", height=450)
     st.plotly_chart(fig, use_container_width=True)
 
