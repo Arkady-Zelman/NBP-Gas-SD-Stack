@@ -31,7 +31,7 @@ src/
 ## Supply Components
 
 | Component | Source |
-|---|---|---|
+|---|---|
 | UKCS Production | NSTA monthly CSV |
 | Norwegian Pipelines | Gassco transparency |
 | IUK Import | National Gas Data Portal |
@@ -41,8 +41,8 @@ src/
 
 ## Demand Components
 
-| Component | Default Source | Replace With |
-|---|---|---|
+| Component | Source |
+|---|---|
 | Residential/Commercial |  National Gas LDZ demand |
 | Industrial |  National Gas DM/LDM |
 | CCGT Power Gen | dummy → API | Elexon/BMRS |
