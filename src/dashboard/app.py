@@ -14,6 +14,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -45,16 +46,16 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* Fade-in animation for main content */
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to   { opacity: 1; transform: translateY(0); }
+/* ── Page entrance: slide up from below with blur dissolve ── */
+@keyframes pageEnter {
+    0%   { opacity: 0; transform: translateY(32px); filter: blur(3px); }
+    100% { opacity: 1; transform: translateY(0);    filter: blur(0);   }
 }
 section.main .block-container {
-    animation: fadeIn 0.4s ease-out;
+    animation: pageEnter 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* Borders around chart containers */
+/* ── Borders around chart containers ── */
 div[data-testid="stPlotlyChart"] {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 10px;
@@ -63,7 +64,7 @@ div[data-testid="stPlotlyChart"] {
     margin-bottom: 1rem;
 }
 
-/* Style metric cards */
+/* ── Style metric cards ── */
 div[data-testid="stMetric"] {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 10px;
@@ -71,22 +72,22 @@ div[data-testid="stMetric"] {
     background: rgba(255, 255, 255, 0.03);
 }
 
-/* Style dataframes */
+/* ── Style dataframes ── */
 div[data-testid="stDataFrame"] {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 10px;
     overflow: hidden;
 }
 
-/* Sidebar radio buttons — tighter spacing */
+/* ── Sidebar radio — tighter spacing ── */
 div[data-testid="stSidebar"] .stRadio > div { gap: 0.25rem; }
 
-/* Smooth sidebar transitions */
+/* ── Smooth sidebar width ── */
 section[data-testid="stSidebar"] {
     transition: width 0.3s ease;
 }
 
-/* Hide Streamlit branding */
+/* ── Hide Streamlit chrome ── */
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
 </style>
@@ -717,3 +718,39 @@ PAGES = {
 }
 
 PAGES[page]()
+
+# =====================================================================
+# Page-exit animation: JS hooks navigation clicks to float content up
+# =====================================================================
+
+components.html("""
+<script>
+(function() {
+    var pd = window.parent.document;
+
+    function bind() {
+        var labels = pd.querySelectorAll(
+            '[data-testid="stSidebar"] [role="radiogroup"] label'
+        );
+        for (var i = 0; i < labels.length; i++) {
+            if (labels[i].dataset._tx) continue;
+            labels[i].dataset._tx = '1';
+            labels[i].addEventListener('mousedown', function() {
+                var mc = pd.querySelector('section.main .block-container');
+                if (!mc) return;
+                mc.style.transition =
+                    'opacity 0.22s cubic-bezier(0.22,1,0.36,1), ' +
+                    'transform 0.22s cubic-bezier(0.22,1,0.36,1), ' +
+                    'filter 0.22s cubic-bezier(0.22,1,0.36,1)';
+                mc.style.opacity = '0';
+                mc.style.transform = 'translateY(-28px)';
+                mc.style.filter = 'blur(3px)';
+            });
+        }
+    }
+
+    bind();
+    new MutationObserver(bind).observe(pd.body, {childList: true, subtree: true});
+})();
+</script>
+""", height=0, scrolling=False)
