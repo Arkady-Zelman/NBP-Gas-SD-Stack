@@ -1,5 +1,7 @@
 # NBP Gas Supply & Demand Stack Model
 
+### [Live Dashboard](https://arkady-zelman-nbp-gas-sd-stack.streamlit.app)
+
 A modular Python model of UK gas (NBP) supply and demand with an interactive Streamlit dashboard, powered entirely by live public API data. Dark-themed UI with crosshair navigation, smooth page transitions, and clean data formatting.
 
 ## Quick Start
