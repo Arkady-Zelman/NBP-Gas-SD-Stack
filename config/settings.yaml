@@ -1,0 +1,44 @@
+project:
+  name: "NBP Gas S&D Stack Model"
+  base_unit: "mcm/d"            # million cubic meters per day
+  calorific_value: 39.5          # MJ/m³ — typical UK gas CV
+  mcm_to_gwh: 11.16             # 1 mcm ≈ 11.16 GWh at standard CV
+  mcm_to_therms: 375694.0       # 1 mcm ≈ 375,694 therms
+
+date_range:
+  start: "2020-10-01"           # Gas Year 2020/21 start
+  end: "2026-03-23"
+
+gas_year:
+  start_month: 10               # Gas Year runs Oct–Sep
+  quarters:
+    Q1: [10, 11, 12]            # Oct–Dec
+    Q2: [1, 2, 3]               # Jan–Mar
+    Q3: [4, 5, 6]               # Apr–Jun
+    Q4: [7, 8, 9]               # Jul–Sep
+
+api_keys:
+  gie: ""                        # GIE AGSI+/ALSI API key (register at gie.eu)
+  national_gas: ""               # National Gas Data Portal (if required)
+  elexon: ""                     # Elexon/BMRS API key
+
+data_paths:
+  raw: "data/raw"
+  processed: "data/processed"
+  manual: "data/manual"
+
+supply_components:
+  - ukcs
+  - norway
+  - iuk_import
+  - bbl
+  - lng
+  - storage_withdrawal
+
+demand_components:
+  - residential
+  - industrial
+  - power_gen
+  - iuk_export
+  - moffat_export
+  - storage_injection
