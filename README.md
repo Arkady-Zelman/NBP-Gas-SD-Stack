@@ -11,8 +11,6 @@ pip install -r requirements.txt
 python -m streamlit run src/dashboard/app.py --server.headless true
 ```
 
-Opens at **http://localhost:8501**. On first launch, data is fetched from live APIs (~60 seconds). Subsequent loads are instant from the local parquet cache. Data auto-refreshes once per day; click **Refresh Data Now** in the sidebar for an immediate pull.
-
 ## Hosted Dashboard
 
 Deployed on Streamlit Community Cloud for instant access from any device:
