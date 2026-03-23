@@ -175,7 +175,7 @@ PLOTLY_LAYOUT = dict(
         font_color="#e0e0e0",
         bordercolor="rgba(255,255,255,0.1)",
     ),
-    hovermode="x unified",
+    hovermode="closest",
     legend=dict(
         bgcolor="rgba(0,0,0,0)",
         font=dict(size=12),
@@ -335,6 +335,7 @@ def page_overview():
             ))
         _apply_layout(fig,
             yaxis_title=_vlabel(), height=550,
+            hovermode="x unified",
             legend=dict(orientation="h", y=-0.15, bgcolor="rgba(0,0,0,0)"),
         )
         st.plotly_chart(fig, use_container_width=True)
@@ -352,7 +353,7 @@ def page_overview():
             facet_row="side", height=600,
             labels={agg_col: _vlabel(), "source": "Component", "period": "Period"},
         )
-        _apply_layout(fig)
+        _apply_layout(fig, hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Daily Balance (surplus / deficit)")
@@ -367,7 +368,7 @@ def page_overview():
         marker_color=colors,
         hovertemplate="<b>%{x|%d %b %Y}</b><br>Balance: %{y:,.1f} " + _vlabel() + "<extra></extra>",
     ))
-    _apply_layout(fig_bal, yaxis_title=_vlabel(), height=350)
+    _apply_layout(fig_bal, yaxis_title=_vlabel(), height=350, hovermode="x unified")
     st.plotly_chart(fig_bal, use_container_width=True)
 
 
