@@ -359,3 +359,50 @@ class NationalGasClient:
     ) -> pd.DataFrame | None:
         """Sum of all UK storage inflows (mcm/d), converted from kWh."""
         return self._fetch_storage_aggregate(STORAGE_INFLOW_IDS, start, end)
+
+    def get_storage_by_site(
+        self,
+        start: str | date = "2020-10-01",
+        end: str | date | None = None,
+    ) -> pd.DataFrame | None:
+        """Per-site daily injection and withdrawal (mcm/d).
+
+        Returns DataFrame with columns: date, site, injection_mcm, withdrawal_mcm, net_mcm.
+        Parses site name from the ``Data Item`` column which has the format
+        ``"Inflow, Aldbrough, Medium Range Storage"``.
+        """
+        all_ids = STORAGE_INFLOW_IDS + STORAGE_OUTFLOW_IDS
+        pubob_ids = [PUBOB_IDS[k] for k in all_ids if k in PUBOB_IDS]
+        start_dt = date.fromisoformat(str(start))
+        end_dt = date.fromisoformat(str(end)) if end else date.today()
+
+        df = self._fetch_chunked(pubob_ids, start_dt, end_dt)
+        if df is None:
+            return None
+
+        df = self._to_daily(df)
+        df.columns = df.columns.str.strip()
+
+        parts = df["Data Item"].str.split(",", n=2, expand=True)
+        df["direction"] = parts[0].str.strip().str.lower()
+        df["site"] = parts[1].str.strip()
+
+        inj = (
+            df[df["direction"] == "inflow"]
+            .groupby(["date", "site"], as_index=False)["Value"]
+            .sum()
+            .rename(columns={"Value": "injection_mcm"})
+        )
+        inj["injection_mcm"] = kwh_to_mcm(inj["injection_mcm"])
+
+        wdr = (
+            df[df["direction"] == "outflow"]
+            .groupby(["date", "site"], as_index=False)["Value"]
+            .sum()
+            .rename(columns={"Value": "withdrawal_mcm"})
+        )
+        wdr["withdrawal_mcm"] = kwh_to_mcm(wdr["withdrawal_mcm"])
+
+        merged = pd.merge(inj, wdr, on=["date", "site"], how="outer").fillna(0)
+        merged["net_mcm"] = merged["injection_mcm"] - merged["withdrawal_mcm"]
+        return merged.sort_values(["date", "site"]).reset_index(drop=True)

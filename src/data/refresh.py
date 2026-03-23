@@ -176,6 +176,18 @@ def _refresh_national_gas() -> dict[str, str]:
         except Exception as exc:
             results[component] = f"FAIL: {exc}"
 
+    # Storage by site (per-facility flows for the map)
+    try:
+        df = client.get_storage_by_site()
+        if df is not None and not df.empty:
+            df["data_quality"] = "api"
+            cache.save("Storage By Site", df)
+            results["Storage By Site"] = f"OK ({len(df)} rows, {df['site'].nunique()} sites)"
+        else:
+            results["Storage By Site"] = "EMPTY"
+    except Exception as exc:
+        results["Storage By Site"] = f"FAIL: {exc}"
+
     # IUK Export (same endpoint as IUK Import, cached separately)
     try:
         df = client.get_physical_flows("IUK")

@@ -200,7 +200,7 @@ def _apply_layout(fig: go.Figure, **overrides) -> go.Figure:
 st.sidebar.title("NBP Gas S&D Stack")
 page = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Supply Drill-down", "Demand Drill-down", "Scenarios", "Data Quality"],
+    ["Overview", "Supply Drill-down", "Demand Drill-down", "Scenarios", "Storage Map", "Data Quality"],
 )
 
 st.sidebar.markdown("---")
@@ -692,7 +692,7 @@ def page_data_quality():
         "UKCS Production", "Norwegian Pipelines", "IUK Import", "BBL Pipeline",
         "LNG Terminals", "Storage Withdrawal", "Residential/Commercial",
         "Industrial", "CCGT Power Gen", "IUK Export", "Moffat Export",
-        "Storage Injection", "NTS Demand Total",
+        "Storage Injection", "Storage By Site", "NTS Demand Total",
     ]
     cache_rows = []
     for comp in all_components:
@@ -706,6 +706,205 @@ def page_data_quality():
 
 
 # =====================================================================
+# PAGE 6 — Storage Map
+# =====================================================================
+
+STORAGE_SITES = {
+    "Rough":          {"lat": 53.82, "lon":  0.43, "type": "Depleted field (offshore)", "capacity_mcm": 32.6},
+    "Aldbrough":      {"lat": 53.84, "lon": -0.23, "type": "Salt cavern",               "capacity_mcm": 3.3},
+    "Hornsea":        {"lat": 53.96, "lon": -0.17, "type": "Salt cavern",               "capacity_mcm": 3.3},
+    "Hatfield Moor":  {"lat": 53.52, "lon": -1.05, "type": "Depleted field",            "capacity_mcm": 1.2},
+    "Holford":        {"lat": 53.21, "lon": -2.54, "type": "Salt cavern",               "capacity_mcm": 1.6},
+    "Hill Top":       {"lat": 53.23, "lon": -2.56, "type": "Salt cavern",               "capacity_mcm": 0.6},
+    "Stublach":       {"lat": 53.20, "lon": -2.52, "type": "Salt cavern",               "capacity_mcm": 4.0},
+    "Holehouse Farm": {"lat": 53.22, "lon": -2.48, "type": "Salt cavern",               "capacity_mcm": 0.5},
+    "Humbly Grove":   {"lat": 51.18, "lon": -1.05, "type": "Depleted oil field",        "capacity_mcm": 2.8},
+}
+
+
+@st.cache_data(ttl=3600)
+def _load_storage_by_site(start_str: str | None, end_str: str | None):
+    from src.data.national_gas import NationalGasClient
+    cached = cache.load("Storage By Site")
+    if cached is not None and not cached.empty:
+        df = cached.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        if start_str:
+            df = df[df["date"] >= start_str]
+        if end_str:
+            df = df[df["date"] <= end_str]
+        return df
+    client = NationalGasClient()
+    return client.get_storage_by_site(start=start_str or "2020-10-01", end=end_str)
+
+
+def page_storage_map():
+    st.title("UK Gas Storage — Live Map")
+    st.caption("Per-site injection and withdrawal flows from National Gas (kWh → mcm/d)")
+
+    site_df = _load_storage_by_site(start_str, end_str)
+
+    if site_df is None or site_df.empty:
+        st.warning(
+            "No per-site storage data in cache. "
+            "Click **Refresh Data Now** in the sidebar to fetch it."
+        )
+        return
+
+    site_df["date"] = pd.to_datetime(site_df["date"])
+
+    latest_date = site_df["date"].max()
+    latest = site_df[site_df["date"] == latest_date].copy()
+
+    map_rows = []
+    for _, row in latest.iterrows():
+        name = row["site"]
+        meta = STORAGE_SITES.get(name, {})
+        if not meta:
+            continue
+        map_rows.append({
+            "site": name,
+            "lat": meta["lat"],
+            "lon": meta["lon"],
+            "type": meta["type"],
+            "capacity_mcm": meta["capacity_mcm"],
+            "injection_mcm": row.get("injection_mcm", 0),
+            "withdrawal_mcm": row.get("withdrawal_mcm", 0),
+            "net_mcm": row.get("net_mcm", 0),
+        })
+
+    if not map_rows:
+        st.warning("Could not match site data to known locations.")
+        return
+
+    map_df = pd.DataFrame(map_rows)
+    map_df["abs_net"] = map_df["net_mcm"].abs()
+    map_df["status"] = map_df["net_mcm"].apply(
+        lambda x: "Injecting" if x > 0.001 else ("Withdrawing" if x < -0.001 else "Idle")
+    )
+    color_map = {"Injecting": "#2ecc71", "Withdrawing": "#e74c3c", "Idle": "#7f8c8d"}
+    map_df["color"] = map_df["status"].map(color_map)
+    map_df["bubble_size"] = (map_df["abs_net"] * 8).clip(lower=6, upper=45)
+
+    st.subheader(f"Storage Activity — {latest_date.strftime('%d %b %Y')}")
+
+    col_inj, col_wdr, col_net = st.columns(3)
+    col_inj.metric("Total Injection", f"{map_df['injection_mcm'].sum():,.2f} mcm/d")
+    col_wdr.metric("Total Withdrawal", f"{map_df['withdrawal_mcm'].sum():,.2f} mcm/d")
+    net_total = map_df["net_mcm"].sum()
+    col_net.metric(
+        "Net Position",
+        f"{net_total:+,.2f} mcm/d",
+        delta=f"{'Filling' if net_total > 0 else 'Drawing'}",
+        delta_color="normal" if net_total > 0 else "inverse",
+    )
+
+    fig = go.Figure()
+    for status_val in ["Injecting", "Withdrawing", "Idle"]:
+        subset = map_df[map_df["status"] == status_val]
+        if subset.empty:
+            continue
+        fig.add_trace(go.Scattermapbox(
+            lat=subset["lat"],
+            lon=subset["lon"],
+            mode="markers+text",
+            marker=dict(
+                size=subset["bubble_size"],
+                color=color_map[status_val],
+                opacity=0.85,
+            ),
+            text=subset["site"],
+            textposition="top center",
+            textfont=dict(size=11, color="#e0e0e0"),
+            name=status_val,
+            customdata=np.stack([
+                subset["site"],
+                subset["type"],
+                subset["capacity_mcm"],
+                subset["injection_mcm"],
+                subset["withdrawal_mcm"],
+                subset["net_mcm"],
+            ], axis=-1),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Type: %{customdata[1]}<br>"
+                "Capacity: %{customdata[2]:.1f} mcm<br>"
+                "Injection: %{customdata[3]:.2f} mcm/d<br>"
+                "Withdrawal: %{customdata[4]:.2f} mcm/d<br>"
+                "Net: %{customdata[5]:+.2f} mcm/d"
+                "<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        mapbox=dict(
+            style="carto-darkmatter",
+            center=dict(lat=53.0, lon=-1.5),
+            zoom=5.3,
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=600,
+        legend=dict(
+            bgcolor="rgba(20,20,30,0.8)",
+            font=dict(color="#e0e0e0", size=12),
+            x=0.01, y=0.99,
+        ),
+        font=dict(family="Inter, sans-serif", color="#e0e0e0"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Site Detail Table")
+    display = map_df[["site", "type", "capacity_mcm", "injection_mcm", "withdrawal_mcm", "net_mcm", "status"]].copy()
+    display = display.rename(columns={
+        "site": "Site",
+        "type": "Type",
+        "capacity_mcm": "Capacity (mcm)",
+        "injection_mcm": "Injection (mcm/d)",
+        "withdrawal_mcm": "Withdrawal (mcm/d)",
+        "net_mcm": "Net (mcm/d)",
+        "status": "Status",
+    })
+    st.dataframe(
+        display.style.format({
+            "Capacity (mcm)": "{:.1f}",
+            "Injection (mcm/d)": "{:.3f}",
+            "Withdrawal (mcm/d)": "{:.3f}",
+            "Net (mcm/d)": "{:+.3f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Historical Flows by Site")
+    sites_avail = sorted(site_df["site"].unique().tolist())
+    selected_sites = st.multiselect(
+        "Select sites", sites_avail, default=sites_avail, key="storage_sites"
+    )
+    hist = site_df[site_df["site"].isin(selected_sites)]
+    if not hist.empty:
+        fig_hist = go.Figure()
+        site_colors = ["#2ecc71", "#3498db", "#e67e22", "#e74c3c", "#9b59b6",
+                       "#1abc9c", "#f1c40f", "#2980b9", "#c0392b"]
+        for i, site_name in enumerate(selected_sites):
+            s = hist[hist["site"] == site_name]
+            fig_hist.add_trace(go.Scatter(
+                x=s["date"], y=s["net_mcm"],
+                name=site_name, mode="lines",
+                line=dict(color=site_colors[i % len(site_colors)], width=1.5),
+                hovertemplate=(
+                    f"<b>{site_name}</b><br>"
+                    "%{x|%d %b %Y}<br>"
+                    "Net: %{y:+.3f} mcm/d<extra></extra>"
+                ),
+            ))
+        fig_hist.add_hline(y=0, line_dash="dash", line_color="rgba(255,255,255,0.2)")
+        _apply_layout(fig_hist, yaxis_title="Net flow (mcm/d)", height=450)
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+
+# =====================================================================
 # Router
 # =====================================================================
 
@@ -714,6 +913,7 @@ PAGES = {
     "Supply Drill-down": page_supply,
     "Demand Drill-down": page_demand,
     "Scenarios": page_scenarios,
+    "Storage Map": page_storage_map,
     "Data Quality": page_data_quality,
 }
 

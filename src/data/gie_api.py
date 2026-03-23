@@ -126,6 +126,44 @@ class GIEClient:
             logger.warning("Failed to parse AGSI+ data: %s", exc)
             return None
 
+    def get_storage_by_facility(
+        self,
+        country: str = "GB",
+        start: str | date = "2020-10-01",
+        end: str | date | None = None,
+    ) -> pd.DataFrame | None:
+        """Per-facility daily storage inventory: gasInStorage (TWh), full (%).
+        Requires a valid API key."""
+        start_dt = date.fromisoformat(str(start))
+        end_dt = date.fromisoformat(str(end)) if end else date.today()
+
+        records = self._get_paginated(AGSI_BASE, country, start_dt, end_dt)
+        if not records:
+            return None
+
+        try:
+            df = pd.DataFrame(records)
+            if "children" in df.columns:
+                children = df.explode("children").dropna(subset=["children"])
+                facility_rows = pd.json_normalize(children["children"])
+                if facility_rows.empty:
+                    return None
+                for col in ("gasInStorage", "full", "workingGasVolume",
+                            "injection", "withdrawal"):
+                    if col in facility_rows.columns:
+                        facility_rows[col] = pd.to_numeric(
+                            facility_rows[col], errors="coerce"
+                        )
+                if "gasDayStart" in facility_rows.columns:
+                    facility_rows["date"] = pd.to_datetime(
+                        facility_rows["gasDayStart"]
+                    )
+                return facility_rows
+            return None
+        except Exception as exc:
+            logger.warning("Failed to parse AGSI+ facility data: %s", exc)
+            return None
+
     # ------------------------------------------------------------------
     # ALSI — LNG terminals
     # ------------------------------------------------------------------
