@@ -217,6 +217,39 @@ def _refresh_national_gas() -> dict[str, str]:
     except Exception as exc:
         results["Storage By Site"] = f"FAIL: {exc}"
 
+    # SAP / SMP prices and linepack
+    try:
+        price_pubob_keys = ("SAP_Daily", "SMP_Buy_Daily", "SMP_Sell_Daily",
+                            "SAP_7d_Avg", "SAP_30d_Avg", "Linepack_Open", "Linepack_Close")
+        price_pubob_ids = [PUBOB_IDS[k] for k in price_pubob_keys if k in PUBOB_IDS]
+        from datetime import date as _d2, timedelta as _td2
+        raw_p = client._fetch_chunked(price_pubob_ids, _d2.today() - _td2(days=365*3), _d2.today())
+        if raw_p is not None and not raw_p.empty:
+            raw_p = client._to_daily(raw_p)
+            raw_p.columns = raw_p.columns.str.strip()
+            pivot = raw_p.pivot_table(index="date", columns="Data Item", values="Value", aggfunc="first")
+            pivot = pivot.reset_index()
+            col_map = {}
+            for col in pivot.columns:
+                cl = str(col).lower()
+                if "sap" in cl and "actual day" in cl: col_map[col] = "sap"
+                elif "smp buy" in cl and "actual day" in cl: col_map[col] = "smp_buy"
+                elif "smp sell" in cl and "actual day" in cl: col_map[col] = "smp_sell"
+                elif "sap" in cl and "7 day" in cl: col_map[col] = "sap_7d"
+                elif "sap" in cl and "30 day" in cl: col_map[col] = "sap_30d"
+                elif "opening linepack" in cl: col_map[col] = "linepack_open"
+                elif "predicted closing" in cl or "pclp" in cl: col_map[col] = "linepack_close"
+            pivot = pivot.rename(columns=col_map)
+            keep = ["date"] + [c for c in col_map.values() if c in pivot.columns]
+            prices_df = pivot[keep].sort_values("date").reset_index(drop=True)
+            prices_df["data_quality"] = "api"
+            cache.save("NBP Prices", prices_df)
+            results["NBP Prices"] = f"OK ({len(prices_df)} rows)"
+        else:
+            results["NBP Prices"] = "EMPTY"
+    except Exception as exc:
+        results["NBP Prices"] = f"FAIL: {exc}"
+
     # IUK Export (same endpoint as IUK Import, cached separately)
     try:
         df = client.get_physical_flows("IUK")

@@ -91,6 +91,15 @@ PUBOB_IDS = {
     "OUT_HolehouseFarm": "PUBOBJ2418", "OUT_Aldbrough": "PUBOBJ2419",
     "OUT_Holford": "PUBOBJ2420", "OUT_HillTop": "PUBOBJ2421",
     "OUT_Stublach": "PUBOBJ2422",
+
+    # --- Prices (p/therm) ---
+    "SAP_Daily": "PUBOB603",          # SAP, Actual Day (p/therm)
+    "SMP_Buy_Daily": "PUBOB604",      # SMP Buy, Actual Day (p/therm)
+    "SMP_Sell_Daily": "PUBOB605",     # SMP Sell, Actual Day (p/therm)
+    "SAP_7d_Avg": "PUBOB606",         # SAP, 7-day rolling average
+    "SAP_30d_Avg": "PUBOB607",        # SAP, 30-day rolling average
+    "Linepack_Open": "PUBOB29",       # Opening linepack (interim, mcm)
+    "Linepack_Close": "PUBOB30",      # Predicted Closing Linepack (mcm)
 }
 
 # Grouped IDs for batch fetches
@@ -406,3 +415,50 @@ class NationalGasClient:
         merged = pd.merge(inj, wdr, on=["date", "site"], how="outer").fillna(0)
         merged["net_mcm"] = merged["injection_mcm"] - merged["withdrawal_mcm"]
         return merged.sort_values(["date", "site"]).reset_index(drop=True)
+
+    def get_prices(
+        self,
+        start: str | date = "2020-10-01",
+        end: str | date | None = None,
+    ) -> pd.DataFrame | None:
+        """Fetch daily SAP and SMP prices (p/therm) plus linepack."""
+        price_ids = [
+            PUBOB_IDS[k] for k in
+            ("SAP_Daily", "SMP_Buy_Daily", "SMP_Sell_Daily",
+             "SAP_7d_Avg", "SAP_30d_Avg", "Linepack_Open", "Linepack_Close")
+            if k in PUBOB_IDS
+        ]
+        start_dt = date.fromisoformat(str(start))
+        end_dt = date.fromisoformat(str(end)) if end else date.today()
+
+        df = self._fetch_chunked(price_ids, start_dt, end_dt)
+        if df is None:
+            return None
+
+        df = self._to_daily(df)
+        df.columns = df.columns.str.strip()
+
+        pivot = df.pivot_table(index="date", columns="Data Item", values="Value", aggfunc="first")
+        pivot = pivot.reset_index()
+
+        col_map = {}
+        for col in pivot.columns:
+            cl = str(col).lower()
+            if "sap" in cl and "actual day" in cl:
+                col_map[col] = "sap"
+            elif "smp buy" in cl and "actual day" in cl:
+                col_map[col] = "smp_buy"
+            elif "smp sell" in cl and "actual day" in cl:
+                col_map[col] = "smp_sell"
+            elif "sap" in cl and "7 day" in cl:
+                col_map[col] = "sap_7d"
+            elif "sap" in cl and "30 day" in cl:
+                col_map[col] = "sap_30d"
+            elif "opening linepack" in cl:
+                col_map[col] = "linepack_open"
+            elif "predicted closing" in cl or "pclp" in cl:
+                col_map[col] = "linepack_close"
+
+        pivot = pivot.rename(columns=col_map)
+        keep = ["date"] + [c for c in col_map.values() if c in pivot.columns]
+        return pivot[keep].sort_values("date").reset_index(drop=True)

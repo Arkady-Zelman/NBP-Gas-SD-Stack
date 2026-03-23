@@ -142,6 +142,41 @@ def _load_demand(start_str: str | None, end_str: str | None):
     return stack.get_all(start_str, end_str), stack.summary(start_str, end_str)
 
 
+@st.cache_data(ttl=3600)
+def _load_prices():
+    cached = cache.load("NBP Prices")
+    if cached is not None and not cached.empty:
+        cached["date"] = pd.to_datetime(cached["date"])
+        return cached
+    try:
+        from src.data.national_gas import NationalGasClient, PUBOB_IDS
+        client = NationalGasClient()
+        ids = [PUBOB_IDS[k] for k in
+               ("SAP_Daily","SMP_Buy_Daily","SMP_Sell_Daily","SAP_7d_Avg","SAP_30d_Avg",
+                "Linepack_Open","Linepack_Close") if k in PUBOB_IDS]
+        raw = client._fetch_chunked(ids, date.today() - timedelta(days=365), date.today())
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        raw = client._to_daily(raw)
+        raw.columns = raw.columns.str.strip()
+        pivot = raw.pivot_table(index="date", columns="Data Item", values="Value", aggfunc="first").reset_index()
+        col_map = {}
+        for col in pivot.columns:
+            cl = str(col).lower()
+            if "sap" in cl and "actual day" in cl: col_map[col] = "sap"
+            elif "smp buy" in cl and "actual day" in cl: col_map[col] = "smp_buy"
+            elif "smp sell" in cl and "actual day" in cl: col_map[col] = "smp_sell"
+            elif "sap" in cl and "7 day" in cl: col_map[col] = "sap_7d"
+            elif "sap" in cl and "30 day" in cl: col_map[col] = "sap_30d"
+            elif "opening linepack" in cl: col_map[col] = "linepack_open"
+            elif "predicted closing" in cl or "pclp" in cl: col_map[col] = "linepack_close"
+        pivot = pivot.rename(columns=col_map)
+        keep = ["date"] + [c for c in col_map.values() if c in pivot.columns]
+        return pivot[keep].sort_values("date").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
 # =====================================================================
 # Plotly dark theme + crosshair defaults
 # =====================================================================
@@ -200,7 +235,9 @@ def _apply_layout(fig: go.Figure, **overrides) -> go.Figure:
 st.sidebar.title("NBP Gas S&D Stack")
 page = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Supply Drill-down", "Demand Drill-down", "Scenarios", "Storage Map", "Data Quality"],
+    ["Trading Dashboard", "Overview", "Supply Drill-down", "Demand Drill-down",
+     "Scenarios", "Storage Map", "Technical Indicators", "Storage Forecast",
+     "Trading Charts", "Price Forecast", "Data Quality"],
 )
 
 st.sidebar.markdown("---")
@@ -692,7 +729,7 @@ def page_data_quality():
         "UKCS Production", "Norwegian Pipelines", "IUK Import", "BBL Pipeline",
         "LNG Terminals", "Storage Withdrawal", "Residential/Commercial",
         "Industrial", "CCGT Power Gen", "IUK Export", "Moffat Export",
-        "Storage Injection", "Storage By Site", "NTS Demand Total",
+        "Storage Injection", "Storage By Site", "NTS Demand Total", "NBP Prices",
     ]
     cache_rows = []
     for comp in all_components:
@@ -939,15 +976,631 @@ def page_storage_map():
 
 
 # =====================================================================
+# PAGE 7 — Trading Dashboard (front page)
+# =====================================================================
+
+def page_trading_dashboard():
+    st.title("Trading Dashboard")
+    st.caption("Key metrics at a glance — updated daily from live APIs")
+
+    _, balance_df, breakdown_df = _load_balance(start_str, end_str)
+    prices = _load_prices()
+
+    if balance_df.empty:
+        st.warning("No data in the selected date range.")
+        return
+
+    latest_bal = balance_df.sort_values("date").iloc[-1]
+    today_str = pd.to_datetime(latest_bal["date"]).strftime("%d %b %Y")
+
+    # Price row
+    if not prices.empty and "sap" in prices.columns:
+        p = prices.dropna(subset=["sap"]).sort_values("date")
+        if not p.empty:
+            latest_p = p.iloc[-1]
+            prev_p = p.iloc[-2] if len(p) > 1 else latest_p
+            delta_p = latest_p["sap"] - prev_p["sap"]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("SAP (p/therm)", f"{latest_p['sap']:.2f}", f"{delta_p:+.2f}")
+            smp_buy = latest_p.get("smp_buy", np.nan)
+            smp_sell = latest_p.get("smp_sell", np.nan)
+            c2.metric("SMP Buy", f"{smp_buy:.2f}" if pd.notna(smp_buy) else "-")
+            c3.metric("SMP Sell", f"{smp_sell:.2f}" if pd.notna(smp_sell) else "-")
+            spread = (smp_buy - smp_sell) if pd.notna(smp_buy) and pd.notna(smp_sell) else np.nan
+            c4.metric("Buy-Sell Spread", f"{spread:.2f}" if pd.notna(spread) else "-")
+            st.markdown("---")
+
+    # Balance KPIs
+    st.subheader(f"System Balance — {today_str}")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Supply", f"{latest_bal['total_supply']:,.1f} mcm/d")
+    k2.metric("Demand", f"{latest_bal['total_demand']:,.1f} mcm/d")
+    bal_val = latest_bal["balance_mcm"]
+    k3.metric("Balance", f"{bal_val:+,.1f} mcm/d",
+              delta="Surplus" if bal_val > 0 else "Deficit",
+              delta_color="normal" if bal_val > 0 else "inverse")
+
+    # Linepack
+    if not prices.empty and "linepack_open" in prices.columns:
+        lp = prices.dropna(subset=["linepack_open"]).sort_values("date")
+        if not lp.empty:
+            lp_val = lp.iloc[-1]["linepack_open"]
+            k4.metric("Linepack (open)", f"{lp_val:,.0f} mcm")
+
+    st.markdown("---")
+
+    # Monthly imports / exports
+    bal_month = balance_df.copy()
+    bal_month["date"] = pd.to_datetime(bal_month["date"])
+    this_month = bal_month[bal_month["date"].dt.to_period("M") == pd.Period(date.today(), "M")]
+
+    supply_month = breakdown_df[
+        (breakdown_df["side"] == "supply") &
+        (pd.to_datetime(breakdown_df["date"]).dt.to_period("M") == pd.Period(date.today(), "M"))
+    ]
+    demand_month = breakdown_df[
+        (breakdown_df["side"] == "demand") &
+        (pd.to_datetime(breakdown_df["date"]).dt.to_period("M") == pd.Period(date.today(), "M"))
+    ]
+
+    col_s, col_d = st.columns(2)
+
+    with col_s:
+        st.subheader("Imports (MTD avg)")
+        if not supply_month.empty:
+            s_avg = (supply_month.groupby("source")["volume_mcm"].mean()
+                     .sort_values(ascending=False))
+            for src, val in s_avg.items():
+                st.markdown(f"**{src}** — {val:,.1f} mcm/d")
+            st.caption(f"Total supply: {s_avg.sum():,.1f} mcm/d")
+        else:
+            st.info("No import data for this month yet.")
+
+    with col_d:
+        st.subheader("Exports & Demand (MTD avg)")
+        if not demand_month.empty:
+            d_avg = (demand_month.groupby("source")["volume_mcm"].mean()
+                     .sort_values(ascending=False))
+            for src, val in d_avg.items():
+                st.markdown(f"**{src}** — {val:,.1f} mcm/d")
+            st.caption(f"Total demand: {d_avg.sum():,.1f} mcm/d")
+        else:
+            st.info("No demand data for this month yet.")
+
+    st.markdown("---")
+
+    # Mini 30-day balance chart
+    st.subheader("Balance — Last 30 Days")
+    recent = bal_month.tail(30)
+    if not recent.empty:
+        colors = recent["balance_mcm"].apply(lambda x: "#2ecc71" if x >= 0 else "#e74c3c")
+        fig = go.Figure(go.Bar(
+            x=recent["date"], y=recent["balance_mcm"],
+            marker_color=colors,
+            hovertemplate="<b>%{x|%d %b}</b><br>%{y:+,.1f} mcm/d<extra></extra>",
+        ))
+        _apply_layout(fig, yaxis_title="mcm/d", height=280, hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Mini SAP price chart
+    if not prices.empty and "sap" in prices.columns:
+        st.subheader("SAP Price — Last 90 Days")
+        p90 = prices.dropna(subset=["sap"]).tail(90)
+        if not p90.empty:
+            fig_p = go.Figure()
+            fig_p.add_trace(go.Scatter(
+                x=p90["date"], y=p90["sap"], name="SAP",
+                line=dict(color="#e67e22", width=2),
+                hovertemplate="<b>%{x|%d %b %Y}</b><br>SAP: %{y:.2f} p/therm<extra></extra>",
+            ))
+            if "sap_7d" in p90.columns:
+                fig_p.add_trace(go.Scatter(
+                    x=p90["date"], y=p90["sap_7d"], name="7d MA",
+                    line=dict(color="#3498db", width=1, dash="dot"),
+                ))
+            if "sap_30d" in p90.columns:
+                fig_p.add_trace(go.Scatter(
+                    x=p90["date"], y=p90["sap_30d"], name="30d MA",
+                    line=dict(color="#9b59b6", width=1, dash="dash"),
+                ))
+            _apply_layout(fig_p, yaxis_title="p/therm", height=280)
+            st.plotly_chart(fig_p, use_container_width=True)
+
+
+# =====================================================================
+# PAGE 8 — Technical Indicators
+# =====================================================================
+
+def _compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(window).mean()
+    loss = (-delta.clip(upper=0)).rolling(window).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def _compute_stochastic(series: pd.Series, k_period: int = 14, d_period: int = 3):
+    low_min = series.rolling(k_period).min()
+    high_max = series.rolling(k_period).max()
+    k = 100 * (series - low_min) / (high_max - low_min).replace(0, np.nan)
+    d = k.rolling(d_period).mean()
+    return k, d
+
+
+def page_technical_indicators():
+    st.title("Technical Indicators")
+    st.caption("Stochastic, RSI, MACD, and Bollinger Bands on SAP price and system balance")
+
+    prices = _load_prices()
+    _, balance_df, _ = _load_balance(start_str, end_str)
+
+    data_col = st.sidebar.selectbox(
+        "Apply indicators to",
+        ["SAP Price (p/therm)", "System Balance (mcm/d)"],
+        key="ta_series",
+    )
+
+    if data_col == "SAP Price (p/therm)":
+        if prices.empty or "sap" not in prices.columns:
+            st.info("No SAP price data cached. Click **Refresh Data Now**.")
+            return
+        df = prices.dropna(subset=["sap"]).sort_values("date").copy()
+        series = df["sap"]
+        series_name = "SAP (p/therm)"
+        y_label = "p/therm"
+    else:
+        if balance_df.empty:
+            st.warning("No balance data.")
+            return
+        df = balance_df.sort_values("date").copy()
+        series = df["balance_mcm"]
+        series_name = "Balance (mcm/d)"
+        y_label = "mcm/d"
+
+    rsi_window = st.sidebar.slider("RSI window", 5, 30, 14, key="rsi_w")
+    bb_window = st.sidebar.slider("Bollinger window", 10, 50, 20, key="bb_w")
+    bb_std = st.sidebar.slider("Bollinger std", 1.0, 3.0, 2.0, 0.5, key="bb_s")
+
+    dates = df["date"]
+
+    # Price/Series + Bollinger Bands
+    st.subheader(f"{series_name} with Bollinger Bands")
+    sma = series.rolling(bb_window).mean()
+    upper = sma + bb_std * series.rolling(bb_window).std()
+    lower = sma - bb_std * series.rolling(bb_window).std()
+
+    fig_bb = go.Figure()
+    fig_bb.add_trace(go.Scatter(x=dates, y=upper, name="Upper", line=dict(width=0),
+                                showlegend=False))
+    fig_bb.add_trace(go.Scatter(x=dates, y=lower, name="Lower", line=dict(width=0),
+                                fill="tonexty", fillcolor="rgba(52,152,219,0.1)",
+                                showlegend=False))
+    fig_bb.add_trace(go.Scatter(x=dates, y=sma, name=f"SMA({bb_window})",
+                                line=dict(color="#3498db", dash="dot", width=1)))
+    fig_bb.add_trace(go.Scatter(x=dates, y=series, name=series_name,
+                                line=dict(color="#e67e22", width=2),
+                                hovertemplate="%{x|%d %b %Y}<br>%{y:.2f}<extra></extra>"))
+    _apply_layout(fig_bb, yaxis_title=y_label, height=400)
+    st.plotly_chart(fig_bb, use_container_width=True)
+
+    # RSI
+    st.subheader(f"RSI ({rsi_window})")
+    rsi = _compute_rsi(series, rsi_window)
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=dates, y=rsi, name="RSI",
+                                 line=dict(color="#e67e22", width=1.5),
+                                 hovertemplate="%{x|%d %b %Y}<br>RSI: %{y:.1f}<extra></extra>"))
+    fig_rsi.add_hline(y=70, line_dash="dash", line_color="#e74c3c", annotation_text="Overbought")
+    fig_rsi.add_hline(y=30, line_dash="dash", line_color="#2ecc71", annotation_text="Oversold")
+    _apply_layout(fig_rsi, yaxis_title="RSI", height=250)
+    st.plotly_chart(fig_rsi, use_container_width=True)
+
+    # MACD
+    st.subheader("MACD (12, 26, 9)")
+    macd_line, signal_line, hist = _compute_macd(series)
+    fig_macd = go.Figure()
+    fig_macd.add_trace(go.Bar(x=dates, y=hist, name="Histogram",
+                              marker_color=hist.apply(lambda x: "#2ecc71" if x >= 0 else "#e74c3c")))
+    fig_macd.add_trace(go.Scatter(x=dates, y=macd_line, name="MACD",
+                                  line=dict(color="#3498db", width=1.5)))
+    fig_macd.add_trace(go.Scatter(x=dates, y=signal_line, name="Signal",
+                                  line=dict(color="#e67e22", width=1.5, dash="dot")))
+    _apply_layout(fig_macd, yaxis_title="MACD", height=300)
+    st.plotly_chart(fig_macd, use_container_width=True)
+
+    # Stochastic Oscillator
+    st.subheader("Stochastic Oscillator (14, 3)")
+    k, d = _compute_stochastic(series)
+    fig_sto = go.Figure()
+    fig_sto.add_trace(go.Scatter(x=dates, y=k, name="%K",
+                                 line=dict(color="#3498db", width=1.5)))
+    fig_sto.add_trace(go.Scatter(x=dates, y=d, name="%D",
+                                 line=dict(color="#e67e22", width=1.5, dash="dot")))
+    fig_sto.add_hline(y=80, line_dash="dash", line_color="#e74c3c", annotation_text="Overbought")
+    fig_sto.add_hline(y=20, line_dash="dash", line_color="#2ecc71", annotation_text="Oversold")
+    _apply_layout(fig_sto, yaxis_title="Stochastic", height=250)
+    st.plotly_chart(fig_sto, use_container_width=True)
+
+
+# =====================================================================
+# PAGE 9 — Storage Forecast
+# =====================================================================
+
+def page_storage_forecast():
+    st.title("Storage Level Forecast")
+    st.caption("Stochastic simulation of UK aggregate storage based on historical injection/withdrawal patterns")
+
+    site_df = _load_storage_by_site(start_str, end_str)
+    if site_df is None or site_df.empty:
+        st.info("No per-site storage data. Click **Refresh Data Now** to fetch.")
+        return
+
+    site_df["date"] = pd.to_datetime(site_df["date"])
+
+    # Aggregate across all sites
+    agg = site_df.groupby("date", as_index=False).agg(
+        injection=("injection_mcm", "sum"),
+        withdrawal=("withdrawal_mcm", "sum"),
+        net=("net_mcm", "sum"),
+    ).sort_values("date")
+
+    # Build cumulative storage proxy (relative)
+    agg["cumulative"] = agg["net"].cumsum()
+
+    st.subheader("Historical Net Storage Flow (cumulative)")
+    fig_cum = go.Figure()
+    fig_cum.add_trace(go.Scatter(
+        x=agg["date"], y=agg["cumulative"], name="Cumulative Net",
+        fill="tozeroy", fillcolor="rgba(46,204,113,0.15)",
+        line=dict(color="#2ecc71", width=2),
+        hovertemplate="%{x|%d %b %Y}<br>Cumulative: %{y:,.1f} mcm<extra></extra>",
+    ))
+    _apply_layout(fig_cum, yaxis_title="Cumulative net (mcm)", height=350)
+    st.plotly_chart(fig_cum, use_container_width=True)
+
+    # Forecast parameters
+    st.markdown("---")
+    st.subheader("Monte Carlo Forecast")
+    col1, col2, col3 = st.columns(3)
+    horizon = col1.slider("Forecast horizon (days)", 14, 180, 60, key="fc_horizon")
+    n_sims = col2.slider("Simulations", 100, 2000, 500, step=100, key="fc_sims")
+    lookback = col3.slider("Lookback window (days)", 30, 365, 90, key="fc_lookback")
+
+    recent = agg.tail(lookback)
+    net_mean = recent["net"].mean()
+    net_std = recent["net"].std()
+    last_cum = agg["cumulative"].iloc[-1]
+    last_date = agg["date"].iloc[-1]
+
+    np.random.seed(42)
+    forecast_dates = pd.date_range(last_date + timedelta(days=1), periods=horizon, freq="D")
+    simulations = np.zeros((n_sims, horizon))
+    for i in range(n_sims):
+        daily_shocks = np.random.normal(net_mean, net_std, horizon)
+        simulations[i] = last_cum + np.cumsum(daily_shocks)
+
+    p5 = np.percentile(simulations, 5, axis=0)
+    p25 = np.percentile(simulations, 25, axis=0)
+    p50 = np.percentile(simulations, 50, axis=0)
+    p75 = np.percentile(simulations, 75, axis=0)
+    p95 = np.percentile(simulations, 95, axis=0)
+
+    fig_fc = go.Figure()
+    # Historical
+    fig_fc.add_trace(go.Scatter(
+        x=agg["date"], y=agg["cumulative"], name="Historical",
+        line=dict(color="#e67e22", width=2),
+    ))
+    # Confidence bands
+    fig_fc.add_trace(go.Scatter(x=forecast_dates, y=p95, name="95th", line=dict(width=0), showlegend=False))
+    fig_fc.add_trace(go.Scatter(x=forecast_dates, y=p5, name="5th", line=dict(width=0),
+                                fill="tonexty", fillcolor="rgba(52,152,219,0.1)", showlegend=False))
+    fig_fc.add_trace(go.Scatter(x=forecast_dates, y=p75, name="75th", line=dict(width=0), showlegend=False))
+    fig_fc.add_trace(go.Scatter(x=forecast_dates, y=p25, name="25th", line=dict(width=0),
+                                fill="tonexty", fillcolor="rgba(52,152,219,0.2)", showlegend=False))
+    fig_fc.add_trace(go.Scatter(
+        x=forecast_dates, y=p50, name="Median forecast",
+        line=dict(color="#3498db", width=2, dash="dash"),
+        hovertemplate="%{x|%d %b %Y}<br>Median: %{y:,.1f} mcm<extra></extra>",
+    ))
+    _apply_layout(fig_fc, yaxis_title="Cumulative net (mcm)", height=450)
+    st.plotly_chart(fig_fc, use_container_width=True)
+
+    st.caption(
+        f"Based on {lookback}-day lookback: mean daily net = {net_mean:+.2f} mcm/d, "
+        f"std = {net_std:.2f} mcm/d. {n_sims} Monte Carlo paths."
+    )
+
+
+# =====================================================================
+# PAGE 10 — Top 5 Trading Charts
+# =====================================================================
+
+def page_trading_charts():
+    st.title("Top 5 Trading Charts")
+    st.caption("Five high-signal charts for NBP gas trading")
+
+    _, balance_df, breakdown_df = _load_balance(start_str, end_str)
+    prices = _load_prices()
+    all_supply, _ = _load_supply(start_str, end_str)
+    all_demand, _ = _load_demand(start_str, end_str)
+
+    if balance_df.empty:
+        st.warning("No data in range.")
+        return
+
+    balance_df = balance_df.copy()
+    balance_df["date"] = pd.to_datetime(balance_df["date"])
+
+    # CHART 1: SAP vs Balance scatter — reveals price sensitivity
+    st.subheader("1. Price vs Balance (SAP sensitivity)")
+    if not prices.empty and "sap" in prices.columns:
+        merged = pd.merge(
+            balance_df[["date", "balance_mcm"]],
+            prices[["date", "sap"]].dropna(),
+            on="date", how="inner",
+        )
+        if not merged.empty:
+            fig1 = go.Figure(go.Scatter(
+                x=merged["balance_mcm"], y=merged["sap"],
+                mode="markers",
+                marker=dict(size=5, color=merged["sap"], colorscale="YlOrRd",
+                            showscale=True, colorbar=dict(title="p/therm")),
+                hovertemplate="Balance: %{x:,.1f} mcm/d<br>SAP: %{y:.2f} p/therm<extra></extra>",
+            ))
+            z = np.polyfit(merged["balance_mcm"], merged["sap"], 1)
+            x_fit = np.linspace(merged["balance_mcm"].min(), merged["balance_mcm"].max(), 100)
+            fig1.add_trace(go.Scatter(x=x_fit, y=np.polyval(z, x_fit), name="Trend",
+                                      line=dict(color="white", dash="dash", width=1)))
+            _apply_layout(fig1, xaxis_title="Balance (mcm/d)", yaxis_title="SAP (p/therm)", height=400,
+                          showlegend=False)
+            st.plotly_chart(fig1, use_container_width=True)
+    else:
+        st.info("SAP price data not available. Refresh to load.")
+
+    # CHART 2: Supply stack composition over time
+    st.subheader("2. Supply Stack Composition")
+    supply_piv = all_supply.pivot_table(
+        index="date", columns="source", values="volume_mcm", aggfunc="sum"
+    ).fillna(0)
+    fig2 = go.Figure()
+    for i, col_name in enumerate(supply_piv.columns):
+        fig2.add_trace(go.Scatter(
+            x=supply_piv.index, y=supply_piv[col_name],
+            name=col_name, stackgroup="s", line=dict(width=0),
+            fillcolor=SUPPLY_COLORS[i % len(SUPPLY_COLORS)],
+        ))
+    _apply_layout(fig2, yaxis_title="mcm/d", height=350,
+                  hovermode="x unified",
+                  legend=dict(orientation="h", y=-0.15, bgcolor="rgba(0,0,0,0)"))
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # CHART 3: Demand seasonality heatmap
+    st.subheader("3. Demand Seasonality Heatmap")
+    dem_total = balance_df[["date", "total_demand"]].copy()
+    dem_total["month"] = dem_total["date"].dt.month
+    dem_total["year"] = dem_total["date"].dt.year
+    heat_piv = dem_total.pivot_table(index="year", columns="month", values="total_demand", aggfunc="mean")
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    fig3 = go.Figure(go.Heatmap(
+        z=heat_piv.values,
+        x=[month_labels[m-1] for m in heat_piv.columns],
+        y=heat_piv.index.astype(str),
+        colorscale="YlOrRd",
+        hovertemplate="Year: %{y}<br>Month: %{x}<br>Avg demand: %{z:,.1f} mcm/d<extra></extra>",
+    ))
+    _apply_layout(fig3, height=300)
+    st.plotly_chart(fig3, use_container_width=True)
+
+    # CHART 4: IUK net flow (import vs export indicator)
+    st.subheader("4. IUK Net Flow (positive = import)")
+    iuk_imp = all_supply[all_supply["source"].str.contains("IUK", case=False)]
+    iuk_exp = all_demand[all_demand["source"].str.contains("IUK", case=False)]
+    if not iuk_imp.empty and not iuk_exp.empty:
+        iuk_i = iuk_imp.groupby("date")["volume_mcm"].sum().reset_index().rename(columns={"volume_mcm": "import"})
+        iuk_e = iuk_exp.groupby("date")["volume_mcm"].sum().reset_index().rename(columns={"volume_mcm": "export"})
+        iuk = pd.merge(iuk_i, iuk_e, on="date", how="outer").fillna(0)
+        iuk["net"] = iuk["import"] - iuk["export"]
+        colors_iuk = iuk["net"].apply(lambda x: "#2ecc71" if x >= 0 else "#e74c3c")
+        fig4 = go.Figure(go.Bar(
+            x=iuk["date"], y=iuk["net"], marker_color=colors_iuk,
+            hovertemplate="%{x|%d %b %Y}<br>Net: %{y:+,.1f} mcm/d<extra></extra>",
+        ))
+        _apply_layout(fig4, yaxis_title="mcm/d", height=300, hovermode="x unified")
+        st.plotly_chart(fig4, use_container_width=True)
+
+    # CHART 5: Rolling 7d supply vs demand with crossover signals
+    st.subheader("5. Supply vs Demand — 7-day Moving Average")
+    bal = balance_df.copy()
+    bal["supply_7d"] = bal["total_supply"].rolling(7).mean()
+    bal["demand_7d"] = bal["total_demand"].rolling(7).mean()
+    fig5 = go.Figure()
+    fig5.add_trace(go.Scatter(x=bal["date"], y=bal["supply_7d"], name="Supply 7d MA",
+                              line=dict(color="#2ecc71", width=2)))
+    fig5.add_trace(go.Scatter(x=bal["date"], y=bal["demand_7d"], name="Demand 7d MA",
+                              line=dict(color="#e74c3c", width=2)))
+    fig5.add_trace(go.Scatter(x=bal["date"], y=bal["total_supply"], name="Supply (daily)",
+                              line=dict(color="#2ecc71", width=0.5), opacity=0.3))
+    fig5.add_trace(go.Scatter(x=bal["date"], y=bal["total_demand"], name="Demand (daily)",
+                              line=dict(color="#e74c3c", width=0.5), opacity=0.3))
+    _apply_layout(fig5, yaxis_title="mcm/d", height=400)
+    st.plotly_chart(fig5, use_container_width=True)
+
+
+# =====================================================================
+# PAGE 11 — Price Forecast
+# =====================================================================
+
+def page_price_forecast():
+    st.title("NBP Price Forecast")
+    st.caption("Machine-learning model using supply, demand, storage, and seasonality as features")
+
+    prices = _load_prices()
+    _, balance_df, _ = _load_balance(start_str, end_str)
+
+    if prices.empty or "sap" not in prices.columns:
+        st.info("No SAP price data. Click **Refresh Data Now** to fetch.")
+        return
+    if balance_df.empty:
+        st.warning("No balance data in range.")
+        return
+
+    balance_df = balance_df.copy()
+    balance_df["date"] = pd.to_datetime(balance_df["date"])
+    prices["date"] = pd.to_datetime(prices["date"])
+
+    df = pd.merge(balance_df, prices[["date", "sap"]], on="date", how="inner").dropna(subset=["sap"])
+    if len(df) < 30:
+        st.warning("Not enough overlapping data for a model (need 30+ days).")
+        return
+
+    # Feature engineering
+    df["day_of_year"] = df["date"].dt.dayofyear
+    df["month"] = df["date"].dt.month
+    df["weekday"] = df["date"].dt.weekday
+    df["sin_doy"] = np.sin(2 * np.pi * df["day_of_year"] / 365)
+    df["cos_doy"] = np.cos(2 * np.pi * df["day_of_year"] / 365)
+    df["supply_7d"] = df["total_supply"].rolling(7, min_periods=1).mean()
+    df["demand_7d"] = df["total_demand"].rolling(7, min_periods=1).mean()
+    df["balance_7d"] = df["balance_mcm"].rolling(7, min_periods=1).mean()
+    df["sap_lag1"] = df["sap"].shift(1)
+    df["sap_lag7"] = df["sap"].shift(7)
+    df = df.dropna()
+
+    features = ["total_supply", "total_demand", "balance_mcm",
+                "sin_doy", "cos_doy", "weekday",
+                "supply_7d", "demand_7d", "balance_7d",
+                "sap_lag1", "sap_lag7"]
+    target = "sap"
+
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import mean_absolute_error, r2_score
+
+    X = df[features].values
+    y = df[target].values
+    dates_arr = df["date"].values
+
+    # Time-series split: train on first 80%, test on last 20%
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    dates_train, dates_test = dates_arr[:split_idx], dates_arr[split_idx:]
+
+    model = GradientBoostingRegressor(
+        n_estimators=200, max_depth=4, learning_rate=0.05,
+        subsample=0.8, random_state=42,
+    )
+    model.fit(X_train, y_train)
+    y_pred_train = model.predict(X_train)
+    y_pred_test = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, y_pred_test)
+    r2 = r2_score(y_test, y_pred_test)
+
+    # Metrics
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Test MAE", f"{mae:.3f} p/therm")
+    m2.metric("Test R²", f"{r2:.3f}")
+    m3.metric("Training samples", f"{len(X_train)}")
+
+    # Actual vs Predicted chart
+    st.subheader("Actual vs Predicted SAP")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dates_arr, y=y, name="Actual SAP",
+                             line=dict(color="#e67e22", width=2)))
+    fig.add_trace(go.Scatter(x=dates_train, y=y_pred_train, name="Train pred",
+                             line=dict(color="#3498db", width=1, dash="dot"), opacity=0.6))
+    fig.add_trace(go.Scatter(x=dates_test, y=y_pred_test, name="Test pred",
+                             line=dict(color="#2ecc71", width=2)))
+    fig.add_vline(x=dates_test[0], line_dash="dash", line_color="rgba(255,255,255,0.3)",
+                  annotation_text="Train / Test split")
+    _apply_layout(fig, yaxis_title="SAP (p/therm)", height=450)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Feature importance
+    st.subheader("Feature Importance")
+    imp = pd.DataFrame({
+        "Feature": features,
+        "Importance": model.feature_importances_,
+    }).sort_values("Importance")
+    fig_imp = go.Figure(go.Bar(
+        x=imp["Importance"], y=imp["Feature"], orientation="h",
+        marker_color="#3498db",
+        hovertemplate="<b>%{y}</b><br>Importance: %{x:.3f}<extra></extra>",
+    ))
+    _apply_layout(fig_imp, xaxis_title="Importance", height=350, showlegend=False)
+    st.plotly_chart(fig_imp, use_container_width=True)
+
+    # Forward forecast
+    st.markdown("---")
+    st.subheader("Forward Price Projection")
+    fwd_days = st.slider("Forecast horizon (days)", 7, 60, 14, key="price_fwd")
+
+    last_row = df.iloc[-1]
+    fwd_dates = pd.date_range(df["date"].iloc[-1] + timedelta(days=1), periods=fwd_days, freq="D")
+    fwd_prices = []
+    prev_sap = last_row["sap"]
+    prev_sap7 = last_row.get("sap_lag7", prev_sap)
+
+    for i, fd in enumerate(fwd_dates):
+        feat = np.array([[
+            last_row["total_supply"], last_row["total_demand"], last_row["balance_mcm"],
+            np.sin(2 * np.pi * fd.dayofyear / 365),
+            np.cos(2 * np.pi * fd.dayofyear / 365),
+            fd.weekday(),
+            last_row["supply_7d"], last_row["demand_7d"], last_row["balance_7d"],
+            prev_sap, prev_sap7,
+        ]])
+        pred = model.predict(feat)[0]
+        fwd_prices.append(pred)
+        prev_sap7 = prev_sap if i >= 6 else prev_sap7
+        prev_sap = pred
+
+    fig_fwd = go.Figure()
+    fig_fwd.add_trace(go.Scatter(
+        x=df["date"].tail(60), y=df["sap"].tail(60), name="Historical SAP",
+        line=dict(color="#e67e22", width=2),
+    ))
+    fig_fwd.add_trace(go.Scatter(
+        x=fwd_dates, y=fwd_prices, name="Forecast",
+        line=dict(color="#2ecc71", width=2, dash="dash"),
+        hovertemplate="%{x|%d %b %Y}<br>Forecast: %{y:.2f} p/therm<extra></extra>",
+    ))
+    _apply_layout(fig_fwd, yaxis_title="SAP (p/therm)", height=350)
+    st.plotly_chart(fig_fwd, use_container_width=True)
+
+    st.caption(
+        f"Gradient Boosting model with {len(features)} features. "
+        f"Forward projection holds supply/demand constant at last observed values "
+        f"and iterates SAP lag features."
+    )
+
+
+# =====================================================================
 # Router
 # =====================================================================
 
 PAGES = {
+    "Trading Dashboard": page_trading_dashboard,
     "Overview": page_overview,
     "Supply Drill-down": page_supply,
     "Demand Drill-down": page_demand,
     "Scenarios": page_scenarios,
     "Storage Map": page_storage_map,
+    "Technical Indicators": page_technical_indicators,
+    "Storage Forecast": page_storage_forecast,
+    "Trading Charts": page_trading_charts,
+    "Price Forecast": page_price_forecast,
     "Data Quality": page_data_quality,
 }
 
