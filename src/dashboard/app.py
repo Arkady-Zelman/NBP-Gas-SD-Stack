@@ -90,6 +90,13 @@ section[data-testid="stSidebar"] {
 /* ── Hide Streamlit chrome ── */
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
+
+/* ── Right price panel: smooth column transitions ── */
+div[data-testid="stColumns"] > div[data-testid="stColumn"] {
+    transition: width 0.35s cubic-bezier(0.22, 1, 0.36, 1),
+                flex 0.35s cubic-bezier(0.22, 1, 0.36, 1),
+                opacity 0.3s ease;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -273,6 +280,9 @@ if cache_age is not None:
         st.sidebar.caption(f"Data is {cache_age:.0f}h old — will refresh on next load.")
 else:
     st.sidebar.caption("No cached data. Click Refresh to fetch.")
+
+st.sidebar.markdown("---")
+show_price_panel = st.sidebar.toggle("Price Panel", value=False, key="price_panel")
 
 
 def _convert_col(df: pd.DataFrame, col: str = "volume_mcm") -> pd.DataFrame:
@@ -1717,6 +1727,85 @@ def page_price_forecast():
 
 
 # =====================================================================
+# Right-side Price Panel
+# =====================================================================
+
+def _render_price_panel():
+    """Persistent SAP + Balance panel for the right column."""
+    st.markdown(
+        "<div style='border-left:1px solid rgba(255,255,255,0.08); "
+        "padding-left:16px; height:100%;'>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("##### Price & Balance")
+
+    prices = _load_prices()
+    if not prices.empty and "sap" in prices.columns:
+        p = prices.dropna(subset=["sap"]).sort_values("date")
+        if not p.empty:
+            latest = p.iloc[-1]
+            prev = p.iloc[-2] if len(p) > 1 else latest
+            delta = latest["sap"] - prev["sap"]
+            st.metric("SAP", f"{latest['sap']:.2f} p/th", f"{delta:+.2f}")
+
+            smp_b = latest.get("smp_buy", np.nan)
+            smp_s = latest.get("smp_sell", np.nan)
+            if pd.notna(smp_b):
+                st.metric("SMP Buy", f"{smp_b:.2f}")
+            if pd.notna(smp_s):
+                st.metric("SMP Sell", f"{smp_s:.2f}")
+
+            # Mini SAP sparkline (last 30 days)
+            spark = p.tail(30)
+            fig_spark = go.Figure(go.Scatter(
+                x=spark["date"], y=spark["sap"],
+                mode="lines", line=dict(color="#e67e22", width=1.5),
+                hovertemplate="%{x|%d %b}<br>%{y:.2f}<extra></extra>",
+            ))
+            fig_spark.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=0, r=0, t=0, b=0), height=100,
+                xaxis=dict(visible=False), yaxis=dict(visible=False),
+            )
+            st.plotly_chart(fig_spark, use_container_width=True, key="panel_spark_sap")
+
+    try:
+        _, balance_df, _ = _load_balance(start_str, end_str)
+        if not balance_df.empty:
+            bal = balance_df.sort_values("date")
+            latest_b = bal.iloc[-1]
+            bv = latest_b["balance_mcm"]
+            st.metric("Balance", f"{bv:+,.1f} mcm/d",
+                      delta="Surplus" if bv > 0 else "Deficit",
+                      delta_color="normal" if bv > 0 else "inverse")
+            st.metric("Supply", f"{latest_b['total_supply']:,.1f}")
+            st.metric("Demand", f"{latest_b['total_demand']:,.1f}")
+
+            # Mini balance sparkline (last 30 days)
+            recent = bal.tail(30)
+            colors = recent["balance_mcm"].apply(
+                lambda x: "#2ecc71" if x >= 0 else "#e74c3c"
+            )
+            fig_bal = go.Figure(go.Bar(
+                x=recent["date"], y=recent["balance_mcm"],
+                marker_color=colors,
+                hovertemplate="%{x|%d %b}<br>%{y:+,.1f}<extra></extra>",
+            ))
+            fig_bal.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=0, r=0, t=0, b=0), height=100,
+                xaxis=dict(visible=False), yaxis=dict(visible=False),
+            )
+            st.plotly_chart(fig_bal, use_container_width=True, key="panel_spark_bal")
+    except Exception:
+        pass
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =====================================================================
 # Router
 # =====================================================================
 
@@ -1734,7 +1823,14 @@ PAGES = {
     "Data Quality": page_data_quality,
 }
 
-PAGES[page]()
+if show_price_panel and page != "Trading Dashboard":
+    col_main, col_panel = st.columns([7, 3], gap="medium")
+    with col_main:
+        PAGES[page]()
+    with col_panel:
+        _render_price_panel()
+else:
+    PAGES[page]()
 
 # =====================================================================
 # Page-exit animation: JS hooks navigation clicks to float content up
@@ -1745,7 +1841,8 @@ components.html("""
 (function() {
     var pd = window.parent.document;
 
-    function bind() {
+    /* ── Page-exit animation ── */
+    function bindPageTransitions() {
         var labels = pd.querySelectorAll(
             '[data-testid="stSidebar"] [role="radiogroup"] label'
         );
@@ -1766,8 +1863,47 @@ components.html("""
         }
     }
 
-    bind();
-    new MutationObserver(bind).observe(pd.body, {childList: true, subtree: true});
+    /* ── Hover-dim: hovered trace stays opaque, others fade ── */
+    var Plotly = window.parent.Plotly || window.Plotly;
+    function bindHoverDim() {
+        if (!Plotly) { Plotly = window.parent.Plotly || window.Plotly; }
+        if (!Plotly) return;
+        var charts = pd.querySelectorAll('.js-plotly-plot');
+        for (var c = 0; c < charts.length; c++) {
+            var el = charts[c];
+            if (el.dataset._hd) continue;
+            el.dataset._hd = '1';
+
+            (function(div) {
+                div.on('plotly_hover', function(data) {
+                    if (!data || !data.points || !data.points.length) return;
+                    var idx = data.points[0].curveNumber;
+                    var nTraces = (div.data || []).length;
+                    if (nTraces < 2) return;
+                    var opArr = [];
+                    for (var t = 0; t < nTraces; t++) {
+                        opArr.push(t === idx ? 1.0 : 0.2);
+                    }
+                    Plotly.restyle(div, {'opacity': opArr});
+                });
+                div.on('plotly_unhover', function() {
+                    var nTraces = (div.data || []).length;
+                    if (nTraces < 2) return;
+                    var opArr = [];
+                    for (var t = 0; t < nTraces; t++) { opArr.push(1.0); }
+                    Plotly.restyle(div, {'opacity': opArr});
+                });
+            })(el);
+        }
+    }
+
+    function bindAll() {
+        bindPageTransitions();
+        bindHoverDim();
+    }
+
+    bindAll();
+    new MutationObserver(bindAll).observe(pd.body, {childList: true, subtree: true});
 })();
 </script>
 """, height=0, scrolling=False)
